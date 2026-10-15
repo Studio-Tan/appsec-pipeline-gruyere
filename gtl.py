@@ -292,14 +292,13 @@ def _Cond(test, if_true, if_false):
   else:
     return if_false
 
+import ast
+import operator as _operator
 
 def _ExpandEval(expr, specials, params, name):
   """Expands one eval expression."""
-  # Evaluating expressions is dangerous. This is safe because the expressions
-  # being evaluated can only come from the template which we control. However,
-  # to be even safer we pass a dictionary containing only values we want the
-  # expression to have access to and we pass this as both the globals and
-  # locals dict. But is anything ever really safe?
+  # Evaluate a restricted expression using ast.literal_eval for pure literals,
+  # or a safe node-walking evaluator for supported operations.
   d = {
       '_key': name,
       '_this': params,
@@ -309,10 +308,88 @@ def _ExpandEval(expr, specials, params, name):
       'cond': _Cond,
   }
   try:
-    result = eval(expr, d, d)
+    result = _SafeEval(expr.strip(), d)
   except Exception:  # catch everything so a bad expression can't make us fail
     result = ''
   return str(result)
+
+
+def _SafeEval(expr, env):
+  """Evaluates a restricted expression safely without using eval().
+
+  Supports: literals, names from env, attribute access on env values,
+  subscript access, and calls to whitelisted callables in env.
+  """
+  # Fast path: try pure literal first
+  try:
+    return ast.literal_eval(expr)
+  except (ValueError, SyntaxError):
+    pass
+
+  try:
+    tree = ast.parse(expr, mode='eval')
+  except SyntaxError:
+    return ''
+
+  return _EvalNode(tree.body, env)
+
+
+def _EvalNode(node, env):
+  """Recursively evaluates a safe subset of AST nodes."""
+  if isinstance(node, ast.Expression):
+    return _EvalNode(node.body, env)
+  elif isinstance(node, ast.Constant):  # Python 3.8+
+    return node.value
+  elif isinstance(node, ast.Num):  # Python 2 / older 3
+    return node.n
+  elif isinstance(node, ast.Str):  # Python 2 / older 3
+    return node.s
+  elif isinstance(node, ast.Name):
+    if node.id in env:
+      return env[node.id]
+    raise ValueError('Name not allowed: %s' % node.id)
+  elif isinstance(node, ast.Subscript):
+    obj = _EvalNode(node.value, env)
+    if isinstance(node.slice, ast.Index):  # Python < 3.9
+      key = _EvalNode(node.slice.value, env)
+    else:
+      key = _EvalNode(node.slice, env)
+    return obj[key]
+  elif isinstance(node, ast.Attribute):
+    obj = _EvalNode(node.value, env)
+    if node.attr.startswith('_'):
+      raise ValueError('Attribute access not allowed: %s' % node.attr)
+    return getattr(obj, node.attr)
+  elif isinstance(node, ast.Call):
+    func = _EvalNode(node.func, env)
+    if func not in env.values():
+      raise ValueError('Call to non-whitelisted function')
+    args = [_EvalNode(a, env) for a in node.args]
+    kwargs = {kw.arg: _EvalNode(kw.value, env) for kw in node.keywords}
+    return func(*args, **kwargs)
+  elif isinstance(node, ast.IfExp):
+    test = _EvalNode(node.test, env)
+    return _EvalNode(node.body, env) if test else _EvalNode(node.orelse, env)
+  elif isinstance(node, ast.Compare):
+    left = _EvalNode(node.left, env)
+    for op, comparator in zip(node.ops, node.comparators):
+      right = _EvalNode(comparator, env)
+      if isinstance(op, ast.Eq) and not (left == right):
+        return False
+      elif isinstance(op, ast.NotEq) and not (left != right):
+        return False
+      elif isinstance(op, ast.Lt) and not (left < right):
+        return False
+      elif isinstance(op, ast.LtE) and not (left <= right):
+        return False
+      elif isinstance(op, ast.Gt) and not (left > right):
+        return False
+      elif isinstance(op, ast.GtE) and not (left >= right):
+        return False
+      left = right
+    return True
+  else:
+    raise ValueError('Unsupported expression node type: %s' % type(node).__name__)
 
 
 def _FindTag(template, open_marker, close_marker):
